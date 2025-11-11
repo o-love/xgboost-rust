@@ -1,6 +1,6 @@
+use crate::sys;
 use std::ffi::CStr;
 use std::fmt;
-use crate::sys;
 
 pub type XGBoostResult<T> = std::result::Result<T, XGBoostError>;
 

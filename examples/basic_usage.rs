@@ -55,9 +55,9 @@ fn main() -> XGBoostResult<()> {
     // Example prediction data (4 features for iris dataset)
     // This is a sample from the iris dataset
     let data = vec![
-        5.1, 3.5, 1.4, 0.2,  // Row 1: Setosa
-        6.7, 3.0, 5.2, 2.3,  // Row 2: Virginica
-        5.9, 3.0, 4.2, 1.5,  // Row 3: Versicolor
+        5.1, 3.5, 1.4, 0.2, // Row 1: Setosa
+        6.7, 3.0, 5.2, 2.3, // Row 2: Virginica
+        5.9, 3.0, 4.2, 1.5, // Row 3: Versicolor
     ];
     let num_rows = 3;
     let num_features = 4;

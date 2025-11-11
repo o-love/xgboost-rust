@@ -75,14 +75,12 @@ impl Booster {
     /// let booster = Booster::load("model.json").unwrap();
     /// ```
     pub fn load<P: AsRef<Path>>(path: P) -> XGBoostResult<Self> {
-        let path_str = path.as_ref().to_str()
-            .ok_or_else(|| XGBoostError {
-                description: "Path contains invalid UTF-8 characters".to_string(),
-            })?;
-        let path_c_str = CString::new(path_str)
-            .map_err(|e| XGBoostError {
-                description: format!("Path contains NUL byte: {}", e),
-            })?;
+        let path_str = path.as_ref().to_str().ok_or_else(|| XGBoostError {
+            description: "Path contains invalid UTF-8 characters".to_string(),
+        })?;
+        let path_c_str = CString::new(path_str).map_err(|e| XGBoostError {
+            description: format!("Path contains NUL byte: {}", e),
+        })?;
 
         // Create a booster first
         let mut handle: sys::BoosterHandle = ptr::null_mut();
@@ -92,14 +90,13 @@ impl Booster {
 
         // Load model into the booster
         let result = XGBoostError::check_return_value(unsafe {
-            sys::XGBoosterLoadModel(
-                handle,
-                path_c_str.as_ptr(),
-            )
+            sys::XGBoosterLoadModel(handle, path_c_str.as_ptr())
         });
 
         if let Err(e) = result {
-            unsafe { sys::XGBoosterFree(handle); }
+            unsafe {
+                sys::XGBoosterFree(handle);
+            }
             return Err(e);
         }
 
@@ -136,7 +133,9 @@ impl Booster {
         });
 
         if let Err(e) = result {
-            unsafe { sys::XGBoosterFree(handle); }
+            unsafe {
+                sys::XGBoosterFree(handle);
+            }
             return Err(e);
         }
 
@@ -172,7 +171,8 @@ impl Booster {
         training: bool,
     ) -> XGBoostResult<Vec<f32>> {
         // Validate input dimensions
-        let expected_len = num_rows.checked_mul(num_features)
+        let expected_len = num_rows
+            .checked_mul(num_features)
             .ok_or_else(|| XGBoostError {
                 description: format!(
                     "Integer overflow: num_rows ({}) * num_features ({}) exceeds usize::MAX",
@@ -184,7 +184,10 @@ impl Booster {
             return Err(XGBoostError {
                 description: format!(
                     "Data length mismatch: expected {} elements ({}×{}), got {}",
-                    expected_len, num_rows, num_features, data.len()
+                    expected_len,
+                    num_rows,
+                    num_features,
+                    data.len()
                 ),
             });
         }
@@ -237,9 +240,7 @@ impl Booster {
         }
 
         // Copy results to a Vec
-        let results = unsafe {
-            std::slice::from_raw_parts(out_result, out_len as usize).to_vec()
-        };
+        let results = unsafe { std::slice::from_raw_parts(out_result, out_len as usize).to_vec() };
 
         // DMatrix will be automatically freed when _guard goes out of scope
 
@@ -254,10 +255,7 @@ impl Booster {
         let mut out_num_features: u64 = 0;
 
         XGBoostError::check_return_value(unsafe {
-            sys::XGBoosterGetNumFeature(
-                self.handle,
-                &mut out_num_features,
-            )
+            sys::XGBoosterGetNumFeature(self.handle, &mut out_num_features)
         })?;
 
         Ok(out_num_features as usize)
@@ -276,20 +274,15 @@ impl Booster {
     /// booster.save("model_copy.json").unwrap();
     /// ```
     pub fn save<P: AsRef<Path>>(&self, path: P) -> XGBoostResult<()> {
-        let path_str = path.as_ref().to_str()
-            .ok_or_else(|| XGBoostError {
-                description: "Path contains invalid UTF-8 characters".to_string(),
-            })?;
-        let path_c_str = CString::new(path_str)
-            .map_err(|e| XGBoostError {
-                description: format!("Path contains NUL byte: {}", e),
-            })?;
+        let path_str = path.as_ref().to_str().ok_or_else(|| XGBoostError {
+            description: "Path contains invalid UTF-8 characters".to_string(),
+        })?;
+        let path_c_str = CString::new(path_str).map_err(|e| XGBoostError {
+            description: format!("Path contains NUL byte: {}", e),
+        })?;
 
         XGBoostError::check_return_value(unsafe {
-            sys::XGBoosterSaveModel(
-                self.handle,
-                path_c_str.as_ptr(),
-            )
+            sys::XGBoosterSaveModel(self.handle, path_c_str.as_ptr())
         })
     }
 }

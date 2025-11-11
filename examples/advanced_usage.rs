@@ -22,10 +22,7 @@ fn main() -> XGBoostResult<()> {
 
     // Example: Binary classification prediction
     println!("=== Example 1: Normal Prediction ===");
-    let data = vec![
-        5.1, 3.5, 1.4, 0.2,
-        6.7, 3.0, 5.2, 2.3,
-    ];
+    let data = vec![5.1, 3.5, 1.4, 0.2, 6.7, 3.0, 5.2, 2.3];
 
     let predictions = booster.predict(&data, 2, 4, 0, false)?;
     println!("Normal predictions (probabilities): {:?}\n", predictions);
@@ -34,22 +31,16 @@ fn main() -> XGBoostResult<()> {
     println!("=== Example 2: Feature Contributions (SHAP) ===");
     use xgboost_rust::predict_option;
 
-    let shap_values = booster.predict(
-        &data,
-        2,
-        4,
-        predict_option::PRED_CONTRIBS,
-        false
-    )?;
+    let shap_values = booster.predict(&data, 2, 4, predict_option::PRED_CONTRIBS, false)?;
 
     println!("SHAP values for first sample:");
     // SHAP values include one extra value for bias term
     let num_features = 4;
-    for i in 0..=num_features {
+    for (i, &value) in shap_values.iter().enumerate().take(num_features + 1) {
         if i < num_features {
-            println!("  Feature {}: {:.4}", i, shap_values[i]);
+            println!("  Feature {}: {:.4}", i, value);
         } else {
-            println!("  Bias term: {:.4}", shap_values[i]);
+            println!("  Bias term: {:.4}", value);
         }
     }
     println!();
@@ -62,7 +53,9 @@ fn main() -> XGBoostResult<()> {
 
     // Example: Load from buffer (useful for embedded models)
     println!("=== Example 4: Load from Buffer ===");
-    let buffer = std::fs::read(model_path)?;
+    let buffer = std::fs::read(model_path).map_err(|e| xgboost_rust::XGBoostError {
+        description: format!("Failed to read model file: {}", e),
+    })?;
     let booster_from_buffer = Booster::load_from_buffer(&buffer)?;
     println!("✓ Model loaded from buffer ({} bytes)", buffer.len());
 

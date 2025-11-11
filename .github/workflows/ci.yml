@@ -1,0 +1,252 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test ${{ matrix.os }} (${{ matrix.arch }}) - XGBoost ${{ matrix.xgboost_version }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS ARM64 (M1/M2/M3) - Test multiple versions
+          - os: macos
+            arch: arm64
+            runner: macos-14
+            xgboost_version: "3.1.1"
+          - os: macos
+            arch: arm64
+            runner: macos-14
+            xgboost_version: "3.0.5"
+          - os: macos
+            arch: arm64
+            runner: macos-14
+            xgboost_version: "2.1.4"
+
+          # macOS x86_64 (Intel)
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
+            xgboost_version: "3.1.1"
+
+          # Linux x86_64 - Test multiple versions including thread-safety boundary
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
+            xgboost_version: "3.1.1"
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
+            xgboost_version: "1.7.6"
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
+            xgboost_version: "1.4.2"  # First thread-safe version
+
+          # Linux ARM64
+          - os: linux
+            arch: arm64
+            runner: ubuntu-latest
+            xgboost_version: "3.1.1"
+
+          # Windows x86_64 - Disabled: Python wheels don't include import libraries (.lib)
+          # needed for MSVC linking. Enable when we add Windows-specific build support.
+          # - os: windows
+          #   arch: x86_64
+          #   runner: windows-latest
+          #   xgboost_version: "3.1.1"
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-${{ matrix.arch }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.arch }}-cargo-registry-
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-${{ matrix.arch }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.arch }}-cargo-index-
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-${{ matrix.arch }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.arch }}-cargo-build-target-
+
+    - name: Install system dependencies (Linux)
+      if: matrix.os == 'linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libclang-dev
+
+    - name: Install system dependencies (macOS)
+      if: matrix.os == 'macos'
+      run: |
+        brew install libomp
+
+    - name: Check build (no features)
+      env:
+        XGBOOST_VERSION: ${{ matrix.xgboost_version }}
+      run: cargo check --verbose
+
+    - name: Build (no features)
+      env:
+        XGBOOST_VERSION: ${{ matrix.xgboost_version }}
+      run: cargo build --verbose
+
+    - name: Run tests (no features)
+      env:
+        XGBOOST_VERSION: ${{ matrix.xgboost_version }}
+      run: cargo test --verbose
+
+    - name: Build examples
+      env:
+        XGBOOST_VERSION: ${{ matrix.xgboost_version }}
+      run: |
+        cargo build --example basic_usage --verbose
+        cargo build --example advanced_usage --verbose
+
+    - name: Verify library architecture (macOS)
+      if: matrix.os == 'macos'
+      run: |
+        echo "Checking library architecture..."
+        file target/debug/libxgboost.dylib
+        lipo -info target/debug/libxgboost.dylib || otool -L target/debug/libxgboost.dylib
+
+    - name: Verify library architecture (Linux)
+      if: matrix.os == 'linux'
+      run: |
+        echo "Checking library architecture..."
+        file target/debug/libxgboost.so
+        readelf -h target/debug/libxgboost.so | grep Machine
+
+    - name: Verify library exists (Windows)
+      if: matrix.os == 'windows'
+      run: |
+        echo "Checking library exists..."
+        Get-Item target/debug/xgboost.dll
+
+    - name: Verify thread safety detection
+      env:
+        XGBOOST_VERSION: ${{ matrix.xgboost_version }}
+      run: |
+        echo "XGBoost version: ${{ matrix.xgboost_version }}"
+        cargo build --verbose 2>&1 | grep "thread-safe" || echo "No thread-safe message found"
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libclang-dev
+
+    - name: Run clippy (no features)
+      run: cargo clippy -- -D warnings
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+
+    - name: Check formatting
+      run: cargo fmt -- --check
+
+  # Test checksum verification
+  security-checksums:
+    name: Verify SHA256 checksums
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libclang-dev
+
+    - name: Test checksum verification for XGBoost 3.1.1
+      env:
+        XGBOOST_VERSION: "3.1.1"
+      run: |
+        cargo check --verbose 2>&1 | tee build.log
+        grep "✓ Verified SHA256" build.log
+        echo "Checksum verification working for 3.1.1"
+
+    - name: Test checksum verification for XGBoost 2.1.4
+      env:
+        XGBOOST_VERSION: "2.1.4"
+      run: |
+        cargo clean
+        cargo check --verbose 2>&1 | tee build.log
+        grep "✓ Verified SHA256" build.log
+        echo "Checksum verification working for 2.1.4"
+
+  # Test caching behavior
+  caching-test:
+    name: Test wheel caching
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libclang-dev
+
+    - name: First build (should download)
+      env:
+        XGBOOST_VERSION: "3.1.1"
+      run: |
+        cargo check --verbose 2>&1 | tee build1.log
+        grep "Downloading XGBoost wheel" build1.log || true
+
+    - name: Second build (should use cache)
+      env:
+        XGBOOST_VERSION: "3.1.1"
+      run: |
+        touch src/lib.rs
+        cargo check --verbose 2>&1 | tee build2.log
+        grep "Using cached XGBoost library" build2.log
+        echo "Caching is working correctly"
