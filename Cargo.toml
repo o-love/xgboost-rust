@@ -7,6 +7,8 @@ license = "Apache-2.0"
 keywords = ["machine-learning", "gradient-boosting", "xgboost", "ml"]
 categories = ["science"]
 readme = "README.md"
+repository = "https://github.com/aryehlev/xgboost-rust"
+homepage = "https://github.com/aryehlev/xgboost-rust"
 rust-version = "1.70"
 
 [build-dependencies]
