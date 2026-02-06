@@ -9,8 +9,34 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+const DEFAULT_XGBOOST_VERSION: &str = "3.1.1";
+const MAX_HEADER_SIZE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_WHEEL_SIZE_BYTES: usize = 200 * 1024 * 1024;
+const DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 15;
+const DOWNLOAD_READ_TIMEOUT_SECS: u64 = 120;
+const DOWNLOAD_WRITE_TIMEOUT_SECS: u64 = 120;
+
 fn get_xgboost_version() -> String {
-    env::var("XGBOOST_VERSION").unwrap_or_else(|_| "3.1.1".to_string())
+    let raw_version =
+        env::var("XGBOOST_VERSION").unwrap_or_else(|_| DEFAULT_XGBOOST_VERSION.to_string());
+    let version = raw_version.trim().to_string();
+    if let Err(message) = validate_version(&version) {
+        panic!("Invalid XGBOOST_VERSION {}: {}", version, message);
+    }
+    version
+}
+
+fn validate_version(version: &str) -> Result<(), String> {
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() != 3 {
+        return Err("expected semantic version MAJOR.MINOR.PATCH".to_string());
+    }
+    for part in parts {
+        if part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()) {
+            return Err("version must be numeric in all components".to_string());
+        }
+    }
+    Ok(())
 }
 
 // Known SHA256 checksums for header files by version
@@ -59,6 +85,107 @@ fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
+}
+
+fn normalize_sha256(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("SHA256 must be 64 hex characters".to_string());
+    }
+    Ok(trimmed.to_lowercase())
+}
+
+fn build_http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS))
+        .timeout_read(Duration::from_secs(DOWNLOAD_READ_TIMEOUT_SECS))
+        .timeout_write(Duration::from_secs(DOWNLOAD_WRITE_TIMEOUT_SECS))
+        .build()
+}
+
+fn read_to_end_with_limit<R: Read>(
+    reader: &mut R,
+    max_size: usize,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 32 * 1024];
+
+    loop {
+        let read_bytes = reader.read(&mut chunk)?;
+        if read_bytes == 0 {
+            break;
+        }
+
+        if buffer.len() + read_bytes > max_size {
+            return Err(format!("Download exceeded max size of {} bytes", max_size).into());
+        }
+
+        buffer.extend_from_slice(&chunk[..read_bytes]);
+    }
+
+    Ok(buffer)
+}
+
+fn get_default_wheel_sha256(version: &str, os: &str, arch: &str) -> Option<&'static str> {
+    if version != DEFAULT_XGBOOST_VERSION {
+        return None;
+    }
+
+    match (os, arch) {
+        ("linux", "x86_64") => {
+            Some("405e48a201495fe9474f7aa27419f937794726a1bc7d2c2f3208b351c816580a")
+        }
+        ("linux", "aarch64") => {
+            Some("4347671aa8a495595f17135171aeae5f6d9ab4b4e7b02f191864cf2202e3c902")
+        }
+        ("darwin", "x86_64") => {
+            Some("a51a2e488102a007b8c222d58bf855415002e8cdf06d104eea24b08dbf4eec4f")
+        }
+        ("darwin", "aarch64") => {
+            Some("fac06c989f2cf11af7aa546b3bb78e7fa87595891e5dfde28edf3e7492e5440a")
+        }
+        ("windows", "x86_64") => {
+            Some("2e1067489688ad99a410e8f2acdfe9d21a299c2f3b4b25dc8f094eae709c7447")
+        }
+        _ => None,
+    }
+}
+
+fn resolve_wheel_sha256(
+    version: &str,
+    os: &str,
+    arch: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if let Ok(value) = env::var("XGBOOST_WHEEL_SHA256") {
+        let normalized = normalize_sha256(&value)
+            .map_err(|message| format!("Invalid XGBOOST_WHEEL_SHA256: {}", message))?;
+        return Ok(Some(normalized));
+    }
+
+    if let Some(default_hash) = get_default_wheel_sha256(version, os, arch) {
+        return Ok(Some(default_hash.to_string()));
+    }
+
+    Ok(None)
+}
+
+fn get_wheel_download_url(wheel_filename: &str) -> String {
+    if let Ok(url) = env::var("XGBOOST_WHEEL_URL") {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            if !trimmed.starts_with("https://") {
+                println!(
+                    "cargo:warning=XGBOOST_WHEEL_URL is not HTTPS; ensure the source is trusted"
+                );
+            }
+            return trimmed.to_string();
+        }
+    }
+
+    format!(
+        "https://files.pythonhosted.org/packages/py3/x/xgboost/{}",
+        wheel_filename
+    )
 }
 
 fn verify_checksum(
@@ -133,7 +260,10 @@ fn get_platform_info() -> (String, String) {
     (os.to_string(), arch.to_string())
 }
 
-fn download_xgboost_headers(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn download_xgboost_headers(
+    agent: &ureq::Agent,
+    out_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let version = get_xgboost_version();
     let checksums = get_header_checksums();
 
@@ -153,6 +283,7 @@ fn download_xgboost_headers(out_dir: &Path) -> Result<(), Box<dyn std::error::Er
     // Download and verify c_api.h
     let c_api_path = include_dir.join("c_api.h");
     download_and_verify_file(
+        agent,
         &format!(
             "https://raw.githubusercontent.com/dmlc/xgboost/v{}/include/xgboost/c_api.h",
             version
@@ -160,11 +291,13 @@ fn download_xgboost_headers(out_dir: &Path) -> Result<(), Box<dyn std::error::Er
         &c_api_path,
         c_api_expected,
         "c_api.h",
+        MAX_HEADER_SIZE_BYTES,
     )?;
 
     // Download and verify base.h
     let base_path = include_dir.join("base.h");
     download_and_verify_file(
+        agent,
         &format!(
             "https://raw.githubusercontent.com/dmlc/xgboost/v{}/include/xgboost/base.h",
             version
@@ -172,28 +305,32 @@ fn download_xgboost_headers(out_dir: &Path) -> Result<(), Box<dyn std::error::Er
         &base_path,
         base_expected,
         "base.h",
+        MAX_HEADER_SIZE_BYTES,
     )?;
 
     Ok(())
 }
 
 fn download_and_verify_file(
+    agent: &ureq::Agent,
     url: &str,
     dest_path: &Path,
     expected_sha256: &str,
     filename: &str,
+    max_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:warning=Downloading {} from: {}", filename, url);
 
     // Download into memory buffer
-    let response = ureq::get(url).call()?;
-    let status = response.status();
-    if !(200..300).contains(&status) {
-        return Err(format!("Failed to download {}: HTTP {}", filename, status).into());
-    }
-
-    let mut buffer = Vec::new();
-    response.into_reader().read_to_end(&mut buffer)?;
+    let response = match agent.get(url).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(format!("Failed to download {}: HTTP {}", filename, code).into())
+        }
+        Err(e) => return Err(format!("Failed to download {}: {}", filename, e).into()),
+    };
+    let mut reader = response.into_reader();
+    let buffer = read_to_end_with_limit(&mut reader, max_size)?;
 
     // Verify SHA256 checksum
     verify_checksum(&buffer, expected_sha256, filename)?;
@@ -205,7 +342,12 @@ fn download_and_verify_file(
     Ok(())
 }
 
-fn download_with_retry(url: &str, max_retries: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn download_with_retry(
+    agent: &ureq::Agent,
+    url: &str,
+    max_retries: u32,
+    max_size: usize,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut last_error = None;
 
     for attempt in 0..max_retries {
@@ -219,7 +361,7 @@ fn download_with_retry(url: &str, max_retries: u32) -> Result<Vec<u8>, Box<dyn s
             thread::sleep(backoff);
         }
 
-        match ureq::get(url).call() {
+        match agent.get(url).call() {
             Ok(response) => {
                 let status = response.status();
                 if !(200..300).contains(&status) {
@@ -227,13 +369,17 @@ fn download_with_retry(url: &str, max_retries: u32) -> Result<Vec<u8>, Box<dyn s
                     continue;
                 }
 
-                let mut buffer = Vec::new();
-                if let Err(e) = response.into_reader().read_to_end(&mut buffer) {
-                    last_error = Some(e.to_string());
-                    continue;
+                let mut reader = response.into_reader();
+                match read_to_end_with_limit(&mut reader, max_size) {
+                    Ok(buffer) => return Ok(buffer),
+                    Err(e) => {
+                        last_error = Some(e.to_string());
+                        continue;
+                    }
                 }
-
-                return Ok(buffer);
+            }
+            Err(ureq::Error::Status(code, _)) => {
+                last_error = Some(format!("HTTP {}", code));
             }
             Err(e) => {
                 last_error = Some(e.to_string());
@@ -249,7 +395,10 @@ fn download_with_retry(url: &str, max_retries: u32) -> Result<Vec<u8>, Box<dyn s
     .into())
 }
 
-fn download_and_extract_wheel(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn download_and_extract_wheel(
+    agent: &ureq::Agent,
+    out_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (os, arch) = get_platform_info();
     let version = get_xgboost_version();
     let (major, minor, _patch) = parse_version(&version);
@@ -307,6 +456,14 @@ fn download_and_extract_wheel(out_dir: &Path) -> Result<(), Box<dyn std::error::
         _ => "libxgboost.so",
     };
 
+    let expected_wheel_sha256 = resolve_wheel_sha256(&version, &os, &arch)?;
+    if expected_wheel_sha256.is_none() {
+        println!(
+            "cargo:warning=No wheel SHA256 configured for XGBoost {} on {}-{}. Set XGBOOST_WHEEL_SHA256 to enable verification",
+            version, os, arch
+        );
+    }
+
     // Setup paths
     let wheel_dir = out_dir.join("wheel");
     let lib_dir = out_dir.join("libs");
@@ -316,17 +473,30 @@ fn download_and_extract_wheel(out_dir: &Path) -> Result<(), Box<dyn std::error::
     let wheel_path = wheel_dir.join(&wheel_filename);
     let lib_dest_path = lib_dir.join(lib_filename);
 
-    // Check if library already exists and is valid
+    // Check if library already exists
     if lib_dest_path.exists() {
         println!(
             "cargo:warning=Using cached XGBoost library at: {}",
             lib_dest_path.display()
         );
+        if let Some(expected) = expected_wheel_sha256.as_deref() {
+            if wheel_path.exists() {
+                let wheel_buffer = fs::read(&wheel_path)?;
+                if let Err(e) = verify_checksum(&wheel_buffer, expected, &wheel_filename) {
+                    return Err(format!("{} (cached wheel at {})", e, wheel_path.display()).into());
+                }
+            } else {
+                println!(
+                    "cargo:warning=Cached library found but wheel cache missing; cannot verify wheel checksum"
+                );
+            }
+        }
         return Ok(());
     }
 
     // Check if wheel is cached
-    let wheel_buffer = if wheel_path.exists() {
+    let wheel_cached = wheel_path.exists();
+    let wheel_buffer = if wheel_cached {
         println!(
             "cargo:warning=Using cached wheel at: {}",
             wheel_path.display()
@@ -334,29 +504,37 @@ fn download_and_extract_wheel(out_dir: &Path) -> Result<(), Box<dyn std::error::
         fs::read(&wheel_path)?
     } else {
         // Download wheel with retry
-        let download_url = format!(
-            "https://files.pythonhosted.org/packages/py3/x/xgboost/{}",
-            wheel_filename
-        );
+        let download_url = get_wheel_download_url(&wheel_filename);
 
         println!(
             "cargo:warning=Downloading XGBoost wheel from: {}",
             download_url
         );
-        let buffer = download_with_retry(&download_url, 3)?;
+        let buffer = download_with_retry(agent, &download_url, 3, MAX_WHEEL_SIZE_BYTES)?;
+        buffer
+    };
 
-        // Write atomically (temp file + rename)
+    if let Some(expected) = expected_wheel_sha256.as_deref() {
+        if let Err(e) = verify_checksum(&wheel_buffer, expected, &wheel_filename) {
+            if wheel_cached {
+                return Err(format!("{} (cached wheel at {})", e, wheel_path.display()).into());
+            }
+            return Err(e);
+        }
+    }
+
+    if !wheel_cached {
+        // Write atomically (temp file + rename) after verification
         let temp_path = wheel_path.with_extension("tmp");
         {
             let mut temp_file = fs::File::create(&temp_path)?;
-            temp_file.write_all(&buffer)?;
+            temp_file.write_all(&wheel_buffer)?;
             temp_file.sync_all()?;
         }
         fs::rename(&temp_path, &wheel_path)?;
 
         println!("cargo:warning=✓ Downloaded and cached wheel");
-        buffer
-    };
+    }
 
     // Extract library from wheel
     println!("cargo:warning=Extracting library from wheel");
@@ -432,14 +610,16 @@ fn main() {
     let version = get_xgboost_version();
     emit_version_cfg_flags(&version);
 
+    let agent = build_http_agent();
+
     // Download the headers
-    if let Err(e) = download_xgboost_headers(&out_dir) {
+    if let Err(e) = download_xgboost_headers(&agent, &out_dir) {
         eprintln!("Failed to download XGBoost headers: {}", e);
         panic!("Cannot proceed without headers");
     }
 
     // Download and extract the wheel
-    if let Err(e) = download_and_extract_wheel(&out_dir) {
+    if let Err(e) = download_and_extract_wheel(&agent, &out_dir) {
         eprintln!("Failed to download and extract wheel: {}", e);
         panic!("Cannot proceed without compiled library");
     }
@@ -489,30 +669,24 @@ fn main() {
 
     // On macOS/Linux, change the install name/soname to use @loader_path/$ORIGIN
     if os == "darwin" {
-        use std::process::Command;
-        let _ = Command::new("install_name_tool")
-            .arg("-id")
-            .arg(format!("@loader_path/{}", lib_filename))
-            .arg(&lib_source_path)
-            .status();
-        let _ = Command::new("install_name_tool")
-            .arg("-id")
-            .arg(format!("@loader_path/{}", lib_filename))
-            .arg(&lib_dest_path)
-            .status();
+        if let Err(e) = run_install_name_tool(&lib_source_path, lib_filename) {
+            panic!(
+                "install_name_tool failed for {}: {}",
+                lib_source_path.display(),
+                e
+            );
+        }
+        if let Err(e) = run_install_name_tool(&lib_dest_path, lib_filename) {
+            panic!(
+                "install_name_tool failed for {}: {}",
+                lib_dest_path.display(),
+                e
+            );
+        }
     } else if os == "linux" {
-        use std::process::Command;
         // Use patchelf to set soname (if available)
-        let _ = Command::new("patchelf")
-            .arg("--set-soname")
-            .arg(lib_filename)
-            .arg(&lib_source_path)
-            .output();
-        let _ = Command::new("patchelf")
-            .arg("--set-soname")
-            .arg(lib_filename)
-            .arg(&lib_dest_path)
-            .output();
+        maybe_set_soname_with_patchelf(&lib_source_path, lib_filename);
+        maybe_set_soname_with_patchelf(&lib_dest_path, lib_filename);
     }
 
     // Set the library search path for the build-time linker
@@ -570,4 +744,49 @@ fn main() {
     }
 
     println!("cargo:rustc-link-lib=dylib=xgboost");
+}
+
+fn run_install_name_tool(
+    lib_path: &Path,
+    lib_filename: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+    let status = Command::new("install_name_tool")
+        .arg("-id")
+        .arg(format!("@loader_path/{}", lib_filename))
+        .arg(lib_path)
+        .status()
+        .map_err(|e| format!("Failed to run install_name_tool: {}", e))?;
+
+    if !status.success() {
+        return Err("install_name_tool returned a non-zero status".into());
+    }
+
+    Ok(())
+}
+
+fn maybe_set_soname_with_patchelf(lib_path: &Path, lib_filename: &str) {
+    use std::process::Command;
+    match Command::new("patchelf")
+        .arg("--set-soname")
+        .arg(lib_filename)
+        .arg(lib_path)
+        .status()
+    {
+        Ok(status) => {
+            if !status.success() {
+                println!(
+                    "cargo:warning=patchelf returned a non-zero status for {}",
+                    lib_path.display()
+                );
+            }
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=patchelf not available; skipping SONAME update for {} ({})",
+                lib_path.display(),
+                e
+            );
+        }
+    }
 }

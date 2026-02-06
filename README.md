@@ -81,6 +81,28 @@ export XGBOOST_VERSION=3.0.0
 cargo build
 ```
 
+## Supply-Chain Security
+
+This crate verifies SHA256 checksums for XGBoost headers and also enforces wheel checksum verification for the default version (3.1.1).
+
+For non-default versions, you should provide a wheel checksum to enable verification:
+
+```bash
+export XGBOOST_VERSION=3.0.5
+export XGBOOST_WHEEL_SHA256=<64-hex-sha256>
+cargo build
+```
+
+If you use a custom mirror or pre-downloaded wheel, you can set a specific URL (and should also set the SHA256):
+
+```bash
+export XGBOOST_WHEEL_URL=https://your-mirror.example.com/xgboost-3.1.1-py3-none-manylinux_2_28_x86_64.whl
+export XGBOOST_WHEEL_SHA256=<64-hex-sha256>
+cargo build
+```
+
+`XGBOOST_VERSION` must be in `MAJOR.MINOR.PATCH` format (numeric only).
+
 ## How It Works
 
 This crate downloads the appropriate XGBoost Python wheel from PyPI during the build process, extracts the compiled library, and links against it. This approach ensures:
